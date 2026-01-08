@@ -208,6 +208,17 @@ def to_daily_mean(df: pd.DataFrame) -> pd.Series:
     s = df.set_index("time")["value"]
     return s.resample("D").mean()
 
+def to_daily_sum(df: pd.DataFrame) -> pd.Series:
+    """
+    Convert time-indexed values to daily totals (sum).
+    Good for incremental precipitation measurements.
+    """
+    if df.empty:
+        return pd.Series(dtype="float64")
+    s = df.set_index("time")["value"]
+    return s.resample("D").sum()
+
+
 
 # ----------------------------
 # Step 4: If Pier 26 doesn't have precipitation, find a nearby monitoring location with precip (00045).
@@ -297,39 +308,25 @@ def find_nearby_precip_site(
 # Main
 # ----------------------------
 if __name__ == "__main__":
+
+    # 1. Define time window FIRST
     end = date.today()
     start = end - timedelta(days=365 * 3)
 
+    # 2. Get monitoring location + metadata
+    pier_feat = get_monitoring_location(PIER26_MONITORING_LOCATION_ID)
     pier_ts_meta = get_time_series_metadata(PIER26_MONITORING_LOCATION_ID)
     pier_params = extract_available_parameter_codes(pier_ts_meta)
 
-    def show_param_meta(pcode: str, params_map: dict):
-        recs = params_map.get(pcode, [])
-        print(f"\n--- Metadata for parameter {pcode} ---")
-        for r in recs[:5]:
-            print({
-                "parameter_code": r.get("parameter_code"),
-                "parameter_name": r.get("parameter_name"),
-                "unit_of_measure": r.get("unit_of_measure"),
-                "statistic_id": r.get("statistic_id"),
-                "statistic_name": r.get("statistic_name"),
-                "time_series_id": r.get("time_series_id"),
-            })
+    # (Optional diagnostic block here – you can comment it out later)
+    # for pcode in pier_params.keys():
+    #     show_param_meta(pcode, pier_params)
 
-    # diagnostic: show ALL parameter metadata (run once)
-    for pcode in pier_params.keys():
-        show_param_meta(pcode, pier_params)
-
-    # ---- now continue with normal logic ----
-    salinity_pcode = None
-
-    # Resolve salinity parameter code at Pier 26:
-    # prefer 70386 if present; otherwise look for any parameter with "salinity" in description/name.
+    # 3. Resolve SALINITY parameter code
     salinity_pcode = None
     if SALINITY_PCODE_HINTS & set(pier_params.keys()):
         salinity_pcode = sorted(SALINITY_PCODE_HINTS & set(pier_params.keys()))[0]
     else:
-        # heuristic search through metadata descriptions
         for pcode, records in pier_params.items():
             text = " ".join(
                 str(r.get("parameter_name", "")) + " " + str(r.get("parameter_description", ""))
@@ -340,63 +337,53 @@ if __name__ == "__main__":
                 break
 
     if not salinity_pcode:
-        raise RuntimeError(
-            "Could not find a salinity-related parameter code for Pier 26 from time-series metadata. "
-            "Inspect pier_params keys or print pier_ts_meta for details."
-        )
+        raise RuntimeError("No salinity parameter found at this site.")
 
-    # SALINITY: try daily first; fall back to continuous -> daily mean
-    try:
-        sal_daily_df = fetch_daily_values(PIER26_MONITORING_LOCATION_ID, salinity_pcode, start, end)
-        sal_series = sal_daily_df.set_index("time")["value"]
-        if sal_series.empty:
-            raise ValueError("Empty daily salinity series")
-    except Exception:
-        sal_cont_df = fetch_continuous_values(PIER26_MONITORING_LOCATION_ID, salinity_pcode, start, end)
-        sal_series = to_daily_mean(sal_cont_df)
-
-    sal_stats = summarize_series(sal_series)
-
-    # PRECIPITATION: check if Pier 26 even has it; if not, find nearby precip site with 00045.
+    # 4. Resolve precipitation location (Pier 26 or nearby)
     precip_location_id = PIER26_MONITORING_LOCATION_ID
     if PRECIP_PCODE not in pier_params:
         nearby = find_nearby_precip_site(pier_feat)
         if not nearby:
-            raise RuntimeError(
-                "Pier 26 does not appear to have precipitation (00045), and no nearby precip site was found "
-                "in the search bbox. Try increasing bbox_pad_deg or using a known NOAA/NWS station instead."
-            )
+            raise RuntimeError("No precipitation site found nearby.")
         precip_location_id = nearby
 
-    # PRECIP: daily preferred; fall back to continuous -> daily mean
-    try:
-        pr_daily_df = fetch_daily_values(precip_location_id, PRECIP_PCODE, start, end)
-        pr_series = pr_daily_df.set_index("time")["value"]
-        if pr_series.empty:
-            raise ValueError("Empty daily precipitation series")
-    except Exception:
-        pr_cont_df = fetch_continuous_values(precip_location_id, PRECIP_PCODE, start, end)
-        pr_series = to_daily_mean(pr_cont_df)
+    # ---------------------------------------------------------
+    # 🔽 PUT THE SNIPPET HERE (right here)
+    # ---------------------------------------------------------
 
+    # SALINITY: continuous → daily mean
+    sal_cont_df = fetch_continuous_values(
+        PIER26_MONITORING_LOCATION_ID,
+        salinity_pcode,
+        start,
+        end,
+        statistic_id="00011"
+    )
+    sal_series = to_daily_mean(sal_cont_df)
+    sal_stats = summarize_series(sal_series)
+
+    # PRECIP: continuous → daily sum
+    pr_cont_df = fetch_continuous_values(
+        precip_location_id,
+        PRECIP_PCODE,
+        start,
+        end,
+        statistic_id="00011"
+    )
+    pr_series = to_daily_sum(pr_cont_df)
     pr_stats = summarize_series(pr_series)
 
+    # 5. Output results + save CSV
     print("=== Last 3 years summary statistics ===")
-    print(f"Window: {start} to {end}\n")
+    print(sal_stats)
+    print(pr_stats)
 
-    print(f"Salinity site: {PIER26_MONITORING_LOCATION_ID} | parameter_code={salinity_pcode}")
-    print(sal_stats, "\n")
-
-    print(f"Precip site:   {precip_location_id} | parameter_code={PRECIP_PCODE}")
-    print(pr_stats, "\n")
-
-    # Optional: save daily series to CSV
-    out = pd.DataFrame(
-        {
-            "salinity": sal_series,
-            "precip_total": pr_series,
-        }
-    )
+    out = pd.DataFrame({
+        "salinity": sal_series,
+        "precip_total": pr_series,
+    })
     out.index.name = "date_utc"
     out.to_csv("pier26_last3y_salinity_precip_daily.csv")
     print("Saved daily time series to pier26_last3y_salinity_precip_daily.csv")
+    print("Done!")
 
