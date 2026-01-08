@@ -300,12 +300,28 @@ if __name__ == "__main__":
     end = date.today()
     start = end - timedelta(days=365 * 3)
 
-    # Get Pier 26 monitoring location feature (for coordinates / nearby search)
-    pier_feat = get_monitoring_location(PIER26_MONITORING_LOCATION_ID)
-
-    # Discover available parameter codes at Pier 26
     pier_ts_meta = get_time_series_metadata(PIER26_MONITORING_LOCATION_ID)
     pier_params = extract_available_parameter_codes(pier_ts_meta)
+
+    def show_param_meta(pcode: str, params_map: dict):
+        recs = params_map.get(pcode, [])
+        print(f"\n--- Metadata for parameter {pcode} ---")
+        for r in recs[:5]:
+            print({
+                "parameter_code": r.get("parameter_code"),
+                "parameter_name": r.get("parameter_name"),
+                "unit_of_measure": r.get("unit_of_measure"),
+                "statistic_id": r.get("statistic_id"),
+                "statistic_name": r.get("statistic_name"),
+                "time_series_id": r.get("time_series_id"),
+            })
+
+    # diagnostic: show ALL parameter metadata (run once)
+    for pcode in pier_params.keys():
+        show_param_meta(pcode, pier_params)
+
+    # ---- now continue with normal logic ----
+    salinity_pcode = None
 
     # Resolve salinity parameter code at Pier 26:
     # prefer 70386 if present; otherwise look for any parameter with "salinity" in description/name.
