@@ -1,38 +1,60 @@
-
 """
-Goal
-----
-Fetch the last 3 years of *precipitation* + *salinity* statistics for the
-Hudson River Park Pier 26 area (USGS HRECOS gage is site 01376520). :contentReference[oaicite:0]{index=0}
+Hudson River Park (Pier 26 / USGS-01376520) — last 3 years precipitation + salinity
+Clean, refactored script that:
+  1) pulls USGS OGC API continuous data (statistic_id=00011),
+  2) aggregates to daily series:
+       - Salinity: daily mean
+       - Precip: daily total (auto-detect incremental vs cumulative)
+  3) prints summary stats
+  4) saves CSV
+  5) generates an interactive HTML dashboard you can open in a browser
 
-Notes
------
-- USGS parameter code for total precipitation is 00045. :contentReference[oaicite:1]{index=1}
-- USGS has a salinity parameter code 70386 (salinity computed from specific conductance). :contentReference[oaicite:2]{index=2}
-- This script uses the USGS *modernized* Water Data OGC APIs for time series (daily/continuous)
-  to pull data, then computes summary stats over the last 3 years.
-  (The Swagger UI for the Statistics API v0 is JS-rendered and not reliably machine-readable
-  in some environments, so this approach is robust and reproducible.)
+Install deps:
+  /usr/local/bin/python3 -m pip install requests pandas plotly
+
+Run:
+  /usr/local/bin/python3 "/Users/samialemfadli/Desktop/HRECSO Data/data.py"
+
+Outputs:
+  - pier26_last3y_daily.csv
+  - pier26_last3y_dashboard.html
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from datetime import date, timedelta
+from typing import Any, Dict, Optional, Tuple, List
+from pathlib import Path
 
 import requests
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-
-OGC_BASE = "https://api.waterdata.usgs.gov/ogcapi/v0"
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "hudson-pier26-stats-script/1.0"})
+BASE_DIR = Path(__file__).resolve().parent
 
 
 # ----------------------------
-# Helpers
+# Config
+# ----------------------------
+OGC_BASE = "https://api.waterdata.usgs.gov/ogcapi/v0"
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "pier26-salinity-precip/1.0"})
+
+PIER26_MONITORING_LOCATION_ID = "USGS-01376520"
+
+# Parameter codes (from your metadata)
+SALINITY_PCODE = "90860"  # Salinity, wu, at 25C (as discovered at this site)
+PRECIP_PCODE = "00045"    # Precipitation (units: inches at this site)
+
+# Continuous statistic id at this site
+CONT_STAT_ID = "00011"
+
+
+# ----------------------------
+# HTTP helpers
 # ----------------------------
 def _get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     r = SESSION.get(url, params=params, timeout=60)
@@ -40,49 +62,13 @@ def _get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
     return r.json()
 
 
-def _iso(d: date) -> str:
-    return d.isoformat()
-
-
-def _pct(series: pd.Series, q: float) -> float:
-    # q in [0, 1]
-    return float(series.quantile(q, interpolation="linear"))
-
-
-def summarize_series(s: pd.Series) -> Dict[str, Any]:
-    s = s.dropna()
-    if s.empty:
-        return {"count": 0}
-
-    return {
-        "count": int(s.shape[0]),
-        "min": float(s.min()),
-        "p05": _pct(s, 0.05),
-        "p10": _pct(s, 0.10),
-        "p25": _pct(s, 0.25),
-        "median": float(s.median()),
-        "p75": _pct(s, 0.75),
-        "p90": _pct(s, 0.90),
-        "p95": _pct(s, 0.95),
-        "max": float(s.max()),
-        "mean": float(s.mean()),
-        "std": float(s.std(ddof=1)) if s.shape[0] > 1 else 0.0,
-    }
+def _date_range_iso(start: date, end: date) -> str:
+    # OGC 'time' parameter is typically start/end (inclusive/exclusive varies by collection).
+    return f"{start.isoformat()}/{end.isoformat()}"
 
 
 # ----------------------------
-# Step 1: Define the Pier 26 (HRECOS) monitoring location
-# ----------------------------
-PIER26_MONITORING_LOCATION_ID = "USGS-01376520"  # NWIS site no 01376520; labeled Pier 25/26 in NWIS/HRECOS. :contentReference[oaicite:3]{index=3}
-
-# target parameter codes
-PRECIP_PCODE = "00045"   # Precipitation, total :contentReference[oaicite:4]{index=4}
-SALINITY_PCODE_HINTS = {"70386"}  # common “salinity computed from specific conductance” code :contentReference[oaicite:5]{index=5}
-
-
-# ----------------------------
-# Step 2: Discover which parameter codes are actually available at Pier 26
-#         using time-series metadata (so we don't guess wrong).
+# USGS OGC API functions
 # ----------------------------
 def get_time_series_metadata(monitoring_location_id: str) -> List[Dict[str, Any]]:
     url = f"{OGC_BASE}/collections/time-series-metadata/items"
@@ -96,54 +82,28 @@ def get_time_series_metadata(monitoring_location_id: str) -> List[Dict[str, Any]
 
 
 def extract_available_parameter_codes(ts_meta_features: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Returns mapping: parameter_code -> list of time series metadata records
-    """
     mapping: Dict[str, List[Dict[str, Any]]] = {}
     for feat in ts_meta_features:
         props = feat.get("properties", {})
-        pcode = str(props.get("parameter_code", "")).zfill(5) if props.get("parameter_code") else None
+        pcode = props.get("parameter_code")
         if not pcode:
             continue
+        pcode = str(pcode).zfill(5) if str(pcode).isdigit() else str(pcode)
         mapping.setdefault(pcode, []).append(props)
     return mapping
 
 
-# ----------------------------
-# Step 3: Pull DAILY values for last 3 years if available.
-#         If DAILY isn't available for a parameter, fall back to CONTINUOUS and aggregate to daily mean.
-# ----------------------------
-def fetch_daily_values(
-    monitoring_location_id: str,
-    parameter_code: str,
-    start: date,
-    end: date,
-    statistic_id: str = "00003",  # daily mean is commonly 00003 in USGS daily values systems
-) -> pd.DataFrame:
+def get_monitoring_location_feature(monitoring_location_id: str) -> Dict[str, Any]:
     """
-    Returns dataframe with columns: ['time', 'value'] (time is pandas datetime64[ns, UTC])
+    Robust retrieval via queryables (some environments reject /items/{id}).
     """
-    url = f"{OGC_BASE}/collections/daily/items"
-    params = {
-        "monitoring_location_id": monitoring_location_id,
-        "parameter_code": parameter_code,
-        "statistic_id": statistic_id,
-        "time": f"{_iso(start)}/{_iso(end)}",
-        "f": "json",
-        "limit": 10000,
-    }
+    url = f"{OGC_BASE}/collections/monitoring-locations/items"
+    params = {"id": monitoring_location_id, "f": "json", "limit": 1}
     out = _get_json(url, params=params)
     feats = out.get("features", [])
-    rows = []
-    for f in feats:
-        p = f.get("properties", {})
-        t = p.get("time")
-        v = p.get("value")
-        if t is None or v is None:
-            continue
-        rows.append((pd.to_datetime(t, utc=True), float(v)))
-    df = pd.DataFrame(rows, columns=["time", "value"]).sort_values("time")
-    return df
+    if not feats:
+        raise ValueError(f"Monitoring location not found: id={monitoring_location_id}")
+    return feats[0]
 
 
 def fetch_continuous_values(
@@ -151,239 +111,329 @@ def fetch_continuous_values(
     parameter_code: str,
     start: date,
     end: date,
-    statistic_id: str = "00011",  # continuous values often use 00011 (instantaneous) in USGS modernized services
+    statistic_id: str = CONT_STAT_ID,
 ) -> pd.DataFrame:
     """
-    Returns dataframe with columns: ['time', 'value'] (time is pandas datetime64[ns, UTC])
+    Returns DataFrame columns: time (UTC), value (float)
+    Handles pagination via 'next' links when present.
     """
     url = f"{OGC_BASE}/collections/continuous/items"
     params = {
         "monitoring_location_id": monitoring_location_id,
         "parameter_code": parameter_code,
         "statistic_id": statistic_id,
-        "time": f"{_iso(start)}/{_iso(end)}",
+        "time": _date_range_iso(start, end),
         "f": "json",
         "limit": 10000,
     }
 
-    # The continuous endpoint may paginate with "links" / next; handle pagination safely.
-    rows = []
-    next_url = url
-    next_params = params
+    rows: List[Tuple[pd.Timestamp, float]] = []
+    next_url: Optional[str] = url
+    next_params: Optional[Dict[str, Any]] = params
 
-    while True:
+    while next_url:
         out = _get_json(next_url, params=next_params)
-        feats = out.get("features", [])
-        for f in feats:
-            p = f.get("properties", {})
+        for feat in out.get("features", []) or []:
+            p = feat.get("properties", {}) or {}
             t = p.get("time")
             v = p.get("value")
             if t is None or v is None:
                 continue
             rows.append((pd.to_datetime(t, utc=True), float(v)))
 
-        # Look for a "next" link (OGC APIs typically provide this)
+        # Find "next" link
         next_link = None
         for link in out.get("links", []) or []:
             if link.get("rel") == "next" and link.get("href"):
                 next_link = link["href"]
                 break
-        if not next_link:
-            break
 
-        # after the first request, follow the next link directly
-        next_url = next_link
-        next_params = None
+        if next_link:
+            next_url = next_link
+            next_params = None  # next link already contains query
+        else:
+            next_url = None
 
     df = pd.DataFrame(rows, columns=["time", "value"]).sort_values("time")
     return df
 
 
+# ----------------------------
+# Aggregation helpers
+# ----------------------------
 def to_daily_mean(df: pd.DataFrame) -> pd.Series:
-    """
-    Convert a time-indexed value dataframe to daily mean series.
-    """
     if df.empty:
         return pd.Series(dtype="float64")
-    s = df.set_index("time")["value"]
-    return s.resample("D").mean()
+    return df.set_index("time")["value"].resample("D").mean()
+
 
 def to_daily_sum(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype="float64")
+    return df.set_index("time")["value"].resample("D").sum()
+
+
+def detect_precip_mode(df: pd.DataFrame) -> str:
     """
-    Convert time-indexed values to daily totals (sum).
-    Good for incremental precipitation measurements.
+    Heuristic:
+      - If values are almost always non-decreasing within a day and resets sometimes -> cumulative gauge
+      - Otherwise -> incremental tips/amounts
+    Returns: "cumulative" or "incremental"
+
+    This is a best-effort heuristic based on typical precipitation sensor behavior.
+    """
+    if df.empty or df.shape[0] < 50:
+        return "incremental"
+
+    s = df.set_index("time")["value"].sort_index()
+
+    # Sample a subset for speed if huge
+    if s.shape[0] > 200_000:
+        s = s.iloc[:: max(1, s.shape[0] // 200_000)]
+
+    # Check within-day monotonicity (cumulative tends to be non-decreasing most of the time)
+    by_day = s.groupby(s.index.floor("D"))
+    nondec_ratios = []
+    for _, day_vals in by_day:
+        if day_vals.shape[0] < 5:
+            continue
+        diffs = day_vals.diff().dropna()
+        if diffs.empty:
+            continue
+        nondec = (diffs >= 0).mean()
+        nondec_ratios.append(float(nondec))
+        if len(nondec_ratios) >= 30:
+            break
+
+    if not nondec_ratios:
+        return "incremental"
+
+    # If most sampled days are strongly non-decreasing, treat as cumulative
+    if sum(r > 0.90 for r in nondec_ratios) / len(nondec_ratios) >= 0.70:
+        return "cumulative"
+
+    return "incremental"
+
+
+def precip_daily_total(df: pd.DataFrame) -> pd.Series:
+    """
+    Returns daily precipitation totals in the gauge's unit (inches here).
+
+    - If incremental: daily total = sum of values in day
+    - If cumulative: daily total = (daily max - daily min), clipped at >= 0
     """
     if df.empty:
         return pd.Series(dtype="float64")
-    s = df.set_index("time")["value"]
-    return s.resample("D").sum()
 
+    mode = detect_precip_mode(df)
+    s = df.set_index("time")["value"].sort_index()
+
+    if mode == "incremental":
+        return s.resample("D").sum()
+
+    # cumulative
+    daily_max = s.resample("D").max()
+    daily_min = s.resample("D").min()
+    daily = (daily_max - daily_min).clip(lower=0)
+    return daily
 
 
 # ----------------------------
-# Step 4: If Pier 26 doesn't have precipitation, find a nearby monitoring location with precip (00045).
-#         (Many water-quality sites won’t measure rainfall.)
+# Stats helpers
 # ----------------------------
-def get_monitoring_location(monitoring_location_id: str) -> Dict[str, Any]:
-    """
-    Robust approach for this API: query the monitoring-locations items list using
-    a supported queryable field (id), then return the first feature.
-    """
-    url = f"{OGC_BASE}/collections/monitoring-locations/items"
-    params = {
-        "id": monitoring_location_id,  # queryables include `id` :contentReference[oaicite:1]{index=1}
-        "f": "json",
-        "limit": 1,
+def summarize_series(s: pd.Series) -> Dict[str, Any]:
+    s = s.dropna()
+    if s.empty:
+        return {"count": 0}
+
+    def pct(q: float) -> float:
+        return float(s.quantile(q, interpolation="linear"))
+
+    return {
+        "count": int(s.shape[0]),
+        "min": float(s.min()),
+        "p05": pct(0.05),
+        "p10": pct(0.10),
+        "p25": pct(0.25),
+        "median": float(s.median()),
+        "p75": pct(0.75),
+        "p90": pct(0.90),
+        "p95": pct(0.95),
+        "max": float(s.max()),
+        "mean": float(s.mean()),
+        "std": float(s.std(ddof=1)) if s.shape[0] > 1 else 0.0,
     }
-    out = _get_json(url, params=params)
-    feats = out.get("features", [])
-    if not feats:
-        raise ValueError(f"Monitoring location not found for id={monitoring_location_id}")
-    return feats[0]
+
+# ----------------------------
+# Visualization (HTML)
+# ----------------------------
+def build_dashboard_html(
+    daily_df: pd.DataFrame,
+    title: str,
+    salinity_col: str = "salinity",
+    precip_col: str = "precip_in",
+    output_html: str = "pier26_last3y_dashboard.html",
+    default_start=None,
+    default_end=None,
+) -> str:
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=("Salinity (daily mean)", "Precipitation (daily total)"),
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=daily_df.index,
+            y=daily_df[salinity_col],
+            mode="lines",
+            name="Salinity",
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=daily_df.index,
+            y=daily_df[precip_col],
+            name="Precip (in)",
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.update_layout(
+        title=title,
+        hovermode="x unified",
+        height=800,
+        margin=dict(l=60, r=30, t=80, b=60),
+    )
+
+    fig.update_yaxes(title_text="Salinity (sensor units)", row=1, col=1)
+    fig.update_yaxes(title_text="Inches", row=2, col=1)
+
+    # Range selector + slider
+    range_selector = dict(
+        buttons=[
+            dict(count=1, label="1M", step="month", stepmode="backward"),
+            dict(count=3, label="3M", step="month", stepmode="backward"),
+            dict(count=6, label="6M", step="month", stepmode="backward"),
+            dict(count=1, label="YTD", step="year", stepmode="todate"),
+            dict(count=1, label="1Y", step="year", stepmode="backward"),
+            dict(step="all", label="All"),
+        ]
+    )
+
+    fig.update_xaxes(
+        title_text="Date",
+        rangeslider=dict(visible=True),
+        rangeselector=range_selector,
+        row=2,
+        col=1,
+    )
+    fig.update_xaxes(rangeselector=range_selector, row=1, col=1)
+
+    # ✅ Force initial view to the full dataset range (your last 3 years)
+    if default_start is not None and default_end is not None:
+        fig.update_xaxes(range=[default_start, default_end], row=1, col=1)
+        fig.update_xaxes(range=[default_start, default_end], row=2, col=1)
+
+    fig.write_html(output_html, include_plotlyjs="cdn")
+    return output_html
 
 
+# --- 2) IN main(), right before calling build_dashboard_html(...), add these lines ---
 
-def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    R = 6371.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def find_nearby_precip_site(
-    pier_feat: Dict[str, Any],
-    bbox_pad_deg: float = 0.25,
-    max_candidates: int = 200,
-) -> Optional[str]:
-    """
-    Search nearby monitoring locations, then pick the nearest that has a 00045 time series.
-    Returns monitoring_location_id or None.
-    """
-    geom = pier_feat.get("geometry", {})
-    if geom.get("type") != "Point":
-        return None
-    lon, lat = geom.get("coordinates", [None, None])
-    if lat is None or lon is None:
-        return None
-
-    bbox = f"{lon - bbox_pad_deg},{lat - bbox_pad_deg},{lon + bbox_pad_deg},{lat + bbox_pad_deg}"
-
-    # Pull monitoring locations in bbox (cap at max_candidates)
-    url = f"{OGC_BASE}/collections/monitoring-locations/items"
-    params = {"bbox": bbox, "f": "json", "limit": max_candidates}
-    out = _get_json(url, params=params)
-
-    candidates = []
-    for f in out.get("features", []):
-        mid = f.get("properties", {}).get("monitoring_location_id")
-        g = f.get("geometry", {})
-        if not mid or g.get("type") != "Point":
-            continue
-        clon, clat = g.get("coordinates", [None, None])
-        if clat is None or clon is None:
-            continue
-        candidates.append((mid, clat, clon))
-
-    # For each candidate, check if there is time-series metadata for precip 00045
-    best = None
-    best_dist = None
-    for mid, clat, clon in candidates:
-        try:
-            meta = get_time_series_metadata(mid)
-        except Exception:
-            continue
-        available = extract_available_parameter_codes(meta)
-        if PRECIP_PCODE in available:
-            dist = haversine_km(lat, lon, clat, clon)
-            if best is None or dist < best_dist:
-                best = mid
-                best_dist = dist
-
-    return best
-
+# html_path = build_dashboard_html(
+#     daily_df=daily,
+#     title="Pier 26 (USGS-01376520): Salinity & Precipitation — last 3 years",
+#     output_html=str(BASE_DIR / "pier26_last3y_dashboard.html"),
+#     default_start=full_start,
+#     default_end=full_end,
+# )
 
 # ----------------------------
 # Main
 # ----------------------------
-if __name__ == "__main__":
-
-    # 1. Define time window FIRST
+def main() -> None:
     end = date.today()
     start = end - timedelta(days=365 * 3)
 
-    # 2. Get monitoring location + metadata
-    pier_feat = get_monitoring_location(PIER26_MONITORING_LOCATION_ID)
-    pier_ts_meta = get_time_series_metadata(PIER26_MONITORING_LOCATION_ID)
-    pier_params = extract_available_parameter_codes(pier_ts_meta)
+    # Confirm site exists and pull metadata (optional validation)
+    site = get_monitoring_location_feature(PIER26_MONITORING_LOCATION_ID)
+    site_name = site.get("properties", {}).get("monitoring_location_name", PIER26_MONITORING_LOCATION_ID)
 
-    # (Optional diagnostic block here – you can comment it out later)
-    # for pcode in pier_params.keys():
-    #     show_param_meta(pcode, pier_params)
+    ts_meta = get_time_series_metadata(PIER26_MONITORING_LOCATION_ID)
+    params_map = extract_available_parameter_codes(ts_meta)
 
-    # 3. Resolve SALINITY parameter code
-    salinity_pcode = None
-    if SALINITY_PCODE_HINTS & set(pier_params.keys()):
-        salinity_pcode = sorted(SALINITY_PCODE_HINTS & set(pier_params.keys()))[0]
-    else:
-        for pcode, records in pier_params.items():
-            text = " ".join(
-                str(r.get("parameter_name", "")) + " " + str(r.get("parameter_description", ""))
-                for r in records
-            ).lower()
-            if "salinity" in text:
-                salinity_pcode = pcode
-                break
+    # Soft validation that these parameters exist at this site
+    if SALINITY_PCODE not in params_map:
+        raise RuntimeError(f"Salinity parameter {SALINITY_PCODE} not found at site {PIER26_MONITORING_LOCATION_ID}")
+    if PRECIP_PCODE not in params_map:
+        raise RuntimeError(f"Precip parameter {PRECIP_PCODE} not found at site {PIER26_MONITORING_LOCATION_ID}")
 
-    if not salinity_pcode:
-        raise RuntimeError("No salinity parameter found at this site.")
+    # Fetch continuous series
+    sal_cont = fetch_continuous_values(PIER26_MONITORING_LOCATION_ID, SALINITY_PCODE, start, end, statistic_id=CONT_STAT_ID)
+    pr_cont = fetch_continuous_values(PIER26_MONITORING_LOCATION_ID, PRECIP_PCODE, start, end, statistic_id=CONT_STAT_ID)
 
-    # 4. Resolve precipitation location (Pier 26 or nearby)
-    precip_location_id = PIER26_MONITORING_LOCATION_ID
-    if PRECIP_PCODE not in pier_params:
-        nearby = find_nearby_precip_site(pier_feat)
-        if not nearby:
-            raise RuntimeError("No precipitation site found nearby.")
-        precip_location_id = nearby
+    # Aggregate to daily
+    sal_daily = to_daily_mean(sal_cont)
+    pr_daily = precip_daily_total(pr_cont)
 
-    # ---------------------------------------------------------
-    # 🔽 PUT THE SNIPPET HERE (right here)
-    # ---------------------------------------------------------
-
-    # SALINITY: continuous → daily mean
-    sal_cont_df = fetch_continuous_values(
-        PIER26_MONITORING_LOCATION_ID,
-        salinity_pcode,
-        start,
-        end,
-        statistic_id="00011"
-    )
-    sal_series = to_daily_mean(sal_cont_df)
-    sal_stats = summarize_series(sal_series)
-
-    # PRECIP: continuous → daily sum
-    pr_cont_df = fetch_continuous_values(
-        precip_location_id,
-        PRECIP_PCODE,
-        start,
-        end,
-        statistic_id="00011"
-    )
-    pr_series = to_daily_sum(pr_cont_df)
-    pr_stats = summarize_series(pr_series)
-
-    # 5. Output results + save CSV
-    print("=== Last 3 years summary statistics ===")
-    print(sal_stats)
-    print(pr_stats)
-
-    out = pd.DataFrame({
-        "salinity": sal_series,
-        "precip_total": pr_series,
+    daily = pd.DataFrame({
+        "salinity": sal_daily,
+        "precip_in": pr_daily,
     })
-    out.index.name = "date_utc"
-    out.to_csv("pier26_last3y_salinity_precip_daily.csv")
-    print("Saved daily time series to pier26_last3y_salinity_precip_daily.csv")
+    daily.index.name = "date_utc"
+
+    full_start = daily.index.min()
+    full_end = daily.index.max()
+
+    html_path = build_dashboard_html(
+        daily_df=daily,
+        title="Pier 26 (USGS-01376520): Salinity & Precipitation — last 3 years",
+        output_html=str(BASE_DIR / "pier26_last3y_dashboard.html"),
+        default_start=full_start,
+        default_end=full_end,
+    )
+
+
+    # Summary stats
+    sal_stats = summarize_series(daily["salinity"])
+    pr_stats = summarize_series(daily["precip_in"])
+
+    print("=== Last 3 years summary statistics ===")
+    print(f"Site: {PIER26_MONITORING_LOCATION_ID} — {site_name}")
+    print(f"Window: {start} to {end}\n")
+
+    print(f"Salinity (pcode={SALINITY_PCODE})")
+    print(sal_stats, "\n")
+
+    print(f"Precipitation (pcode={PRECIP_PCODE}, unit=in)")
+    print(pr_stats, "\n")
+
+    # Save CSV
+    csv_path = "pier26_last3y_daily.csv"
+    daily.to_csv(csv_path)
+    print(f"Saved CSV: {csv_path}")
+
+    # Save interactive dashboard HTML
+    html_path = build_dashboard_html(
+        daily_df=daily,
+        title=f"Pier 26 (USGS-01376520): Salinity & Precipitation — last 3 years",
+        output_html="pier26_last3y_dashboard.html",
+    )
+    print(f"Saved dashboard: {html_path}")
+    print("Open it in your browser (double-click in Finder, or run: open pier26_last3y_dashboard.html)")
+
+
+if __name__ == "__main__":
+    main()
+    
+
     print("Done!")
 
