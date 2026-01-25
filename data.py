@@ -1,30 +1,18 @@
 """
-Pier 26 (USGS-01376520) — Last 5 years dashboard for Salinity + Precipitation (USGS OGC API)
+Pier 26 Dashboard: USGS Salinity + NOAA Precipitation (inches)
 
-Features:
-- Pull continuous salinity (90860) and precipitation (00045) from USGS OGC API
-- Chunked requests to avoid 400 errors for long time windows
-- Aggregate daily:
-    Salinity = daily mean
-    Precip   = daily total (sum)
-- Save CSV with both series
-- Build interactive HTML dashboard (index.html) with:
-    - Start/End date inputs (bounded to available data window)
-    - k·σ inputs for each series
-    - Data coverage % for each series in the displayed interval
-    - Toggle: precip highlight only above average
-    - Rolling 7-day mean overlays for both series
-    - Highlights values outside mean ± k·σ (or above mean + k·σ for precip)
+Outputs:
+- pier26_last5y_salinity_precip_daily.csv (merged daily cache)
+- noaa_prcp_daily.csv (NOAA-only cache)
+- index.html (interactive dashboard)
 
-Install:
-  /usr/local/bin/python3 -m pip install requests pandas plotly
+Install deps:
+  python3 -m pip install requests pandas plotly
 
 Run:
-  /usr/local/bin/python3 "/Users/samialemfadli/Desktop/HRECSO Data/data.py"
-
-Outputs (in same folder as this script):
-  pier26_last5y_salinity_precip_daily.csv
-  index.html   (ready for GitHub Pages)
+  export NOAA_TOKEN="YOUR_TOKEN"
+  python3 data.py
+  open index.html
 """
 
 from __future__ import annotations
@@ -33,62 +21,133 @@ from pathlib import Path
 from datetime import date, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
+import os
 import json
+import time
+
 import requests
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ----------------------------
 # Config
 # ----------------------------
 BASE_DIR = Path(__file__).resolve().parent
+
+WINDOW_YEARS = 5
+
+# USGS OGC API
 OGC_BASE = "https://api.waterdata.usgs.gov/ogcapi/v0"
-
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "pier26-dashboard/1.0"})
-
 PIER26_MONITORING_LOCATION_ID = "USGS-01376520"
-
-# Parameter codes
 SALINITY_PCODE = "90860"
-PRECIP_PCODE = "00045"
+USGS_CONT_STAT_ID = "00011"
 
-# Statistic ID that worked in your earlier runs
-CONT_STAT_ID = "00011"
+# Smaller chunks/pages reduce stalls + rate-limits
+USGS_CHUNK_DAYS = 30
+USGS_LIMIT_PER_PAGE = 2000
 
-# Chunking prevents long-range 400 responses
-CHUNK_DAYS = 180
+# NOAA CDO API (GHCND daily)
+NOAA_BASE = "https://www.ncei.noaa.gov/cdo-web/api/v2"
+NOAA_STATION_ID = "GHCND:USW00094728"  # Central Park precip proxy
+NOAA_LIMIT = 200  # per page
+
+# Cache + output
+DAILY_CACHE_CSV = BASE_DIR / "pier26_last5y_salinity_precip_daily.csv"
+NOAA_CACHE_CSV = BASE_DIR / "noaa_prcp_daily.csv"
+DASHBOARD_HTML = BASE_DIR / "index.html"
 
 
 # ----------------------------
-# HTTP helpers
+# Sessions with retry
 # ----------------------------
-def _get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    r = SESSION.get(url, params=params, timeout=60)
-    r.raise_for_status()
-    return r.json()
+def _make_retry(total: int) -> Retry:
+    return Retry(
+        total=total,
+        connect=total,
+        read=total,
+        backoff_factor=1.2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
 
 
+USGS_SESSION = requests.Session()
+USGS_SESSION.headers.update({"User-Agent": "pier26-dashboard/1.0"})
+USGS_SESSION.mount("https://", HTTPAdapter(max_retries=_make_retry(8)))
+
+NOAA_SESSION = requests.Session()
+NOAA_SESSION.mount("https://", HTTPAdapter(max_retries=_make_retry(6)))
+
+
+# ----------------------------
+# Utilities
+# ----------------------------
 def _date_range_iso(start: date, end: date) -> str:
     return f"{start.isoformat()}/{end.isoformat()}"
 
 
+def _get_json_usgs(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    r = USGS_SESSION.get(url, params=params, timeout=(10, 180))
+
+    if r.status_code == 429:
+        ra = r.headers.get("Retry-After")
+        if ra:
+            try:
+                wait_s = int(float(ra))
+                print(f"USGS 429: sleeping {wait_s}s then retrying...")
+                time.sleep(wait_s)
+                r = USGS_SESSION.get(url, params=params, timeout=(10, 180))
+            except Exception:
+                pass
+
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_json_noaa(endpoint: str, token: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    All NOAA request handling lives here (prevents 'r not defined' errors).
+    Includes status timing + 429 Retry-After respect.
+    """
+    url = f"{NOAA_BASE}{endpoint}"
+    t0 = time.time()
+
+    r = NOAA_SESSION.get(url, headers={"token": token}, params=params, timeout=(10, 180))
+    dt = time.time() - t0
+    print(f"NOAA status={r.status_code} in {dt:.1f}s | offset={params.get('offset')} limit={params.get('limit')}")
+
+    if r.status_code == 429:
+        ra = r.headers.get("Retry-After")
+        if ra:
+            try:
+                wait_s = int(float(ra))
+                print(f"NOAA 429: sleeping {wait_s}s then retrying...")
+                time.sleep(wait_s)
+                r = NOAA_SESSION.get(url, headers={"token": token}, params=params, timeout=(10, 180))
+                print(f"NOAA retry status={r.status_code}")
+            except Exception:
+                pass
+
+    r.raise_for_status()
+    return r.json()
+
+
 # ----------------------------
-# Continuous fetch (single window, paginated)
+# USGS: continuous -> daily mean
 # ----------------------------
-def fetch_continuous_values(
+def fetch_usgs_continuous_values(
     monitoring_location_id: str,
     parameter_code: str,
     start: date,
     end: date,
-    statistic_id: str = CONT_STAT_ID,
+    statistic_id: str = USGS_CONT_STAT_ID,
 ) -> pd.DataFrame:
-    """
-    Fetch continuous values for one time window, following 'next' pagination links.
-    Returns DataFrame columns: time (UTC), value (float)
-    """
     url = f"{OGC_BASE}/collections/continuous/items"
     params = {
         "monitoring_location_id": monitoring_location_id,
@@ -96,7 +155,7 @@ def fetch_continuous_values(
         "statistic_id": statistic_id,
         "time": _date_range_iso(start, end),
         "f": "json",
-        "limit": 10000,
+        "limit": USGS_LIMIT_PER_PAGE,
     }
 
     rows: List[Tuple[pd.Timestamp, float]] = []
@@ -104,7 +163,7 @@ def fetch_continuous_values(
     next_params: Optional[Dict[str, Any]] = params
 
     while next_url:
-        out = _get_json(next_url, params=next_params)
+        out = _get_json_usgs(next_url, params=next_params)
 
         for feat in out.get("features", []) or []:
             p = feat.get("properties", {}) or {}
@@ -122,148 +181,227 @@ def fetch_continuous_values(
 
         if next_link:
             next_url = next_link
-            next_params = None  # already encoded in next link
+            next_params = None
+            time.sleep(0.15)  # pacing
         else:
             next_url = None
 
     return pd.DataFrame(rows, columns=["time", "value"]).sort_values("time")
 
 
-def fetch_continuous_values_chunked(
+def fetch_usgs_continuous_values_chunked(
     monitoring_location_id: str,
     parameter_code: str,
     start: date,
     end: date,
-    statistic_id: str = CONT_STAT_ID,
-    chunk_days: int = 180,
+    statistic_id: str = USGS_CONT_STAT_ID,
+    chunk_days: int = USGS_CHUNK_DAYS,
 ) -> pd.DataFrame:
-    """
-    Fetch continuous values in multiple smaller time chunks.
-    This avoids 400 errors for long windows and keeps requests manageable.
-    """
     parts: List[pd.DataFrame] = []
     cur = start
-
     while cur <= end:
         cur_end = min(end, cur + timedelta(days=chunk_days))
-
-        df_part = fetch_continuous_values(
+        df_part = fetch_usgs_continuous_values(
             monitoring_location_id=monitoring_location_id,
             parameter_code=parameter_code,
             start=cur,
             end=cur_end,
             statistic_id=statistic_id,
         )
-
-        print(f"Fetched {parameter_code} {cur} to {cur_end}: {len(df_part)} rows")
+        print(f"Fetched USGS CONT {parameter_code} {cur} to {cur_end}: {len(df_part)} rows")
         if not df_part.empty:
             parts.append(df_part)
-
         cur = cur_end + timedelta(days=1)
 
     if not parts:
         return pd.DataFrame(columns=["time", "value"])
 
-    df = pd.concat(parts, ignore_index=True)
-    df = df.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
-    return df
+    df = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["time"]).sort_values("time")
+    return df.reset_index(drop=True)
 
 
-# ----------------------------
-# Aggregation
-# ----------------------------
-def to_daily_mean(df: pd.DataFrame) -> pd.Series:
+def to_daily_mean(df: pd.DataFrame, name: str) -> pd.Series:
     if df.empty:
-        return pd.Series(dtype="float64")
-    return df.set_index("time")["value"].resample("D").mean()
-
-
-def to_daily_total(df: pd.DataFrame) -> pd.Series:
-    """
-    For precipitation, daily total is usually most useful for event analysis.
-    Summing within day behaves well whether values are sub-daily or already daily.
-    """
-    if df.empty:
-        return pd.Series(dtype="float64")
-    return df.set_index("time")["value"].resample("D").sum()
+        return pd.Series(dtype="float64", name=name)
+    s = df.set_index("time")["value"].resample("D").mean()
+    s.index = s.index.date
+    s.name = name
+    return s
 
 
 # ----------------------------
-# Dashboard builder (HTML + JS)
+# NOAA: daily PRCP (inches) + cache
 # ----------------------------
-def build_dashboard_html(
-    daily: pd.DataFrame,
-    output_html: str,
-    title: str = "Pier 26 (USGS-01376520): Salinity + Precipitation — last 5 years",
-) -> str:
+def fetch_noaa_ghcnd_prcp_daily_in(
+    station_id: str,
+    start: date,
+    end: date,
+    token: str,
+) -> pd.Series:
+    """
+    GHCND PRCP, units=standard (inches). Query year-by-year, paged.
+    """
+    all_rows: List[Dict[str, Any]] = []
+    y = start.year
+
+    while y <= end.year:
+        chunk_start = date(y, 1, 1)
+        chunk_end = date(y, 12, 31)
+        if y == start.year:
+            chunk_start = start
+        if y == end.year:
+            chunk_end = end
+
+        print(f"Fetching NOAA PRCP {station_id} {chunk_start} to {chunk_end} ...")
+
+        limit = NOAA_LIMIT
+        offset = 1
+
+        while True:
+            out = _get_json_noaa(
+                "/data",
+                token=token,
+                params={
+                    "datasetid": "GHCND",
+                    "datatypeid": "PRCP",
+                    "stationid": station_id,
+                    "startdate": chunk_start.isoformat(),
+                    "enddate": chunk_end.isoformat(),
+                    "units": "standard",  # inches
+                    "limit": limit,
+                    "offset": offset,
+                },
+            )
+
+            rows = out.get("results", [])
+            if not rows:
+                break
+
+            all_rows.extend(rows)
+            time.sleep(0.2)
+
+            meta = out.get("metadata", {}).get("resultset", {}) or {}
+            count = int(meta.get("count", 0) or 0)
+            if offset + limit > count:
+                break
+            offset += limit
+
+        y += 1
+
+    if not all_rows:
+        return pd.Series(dtype="float64", name="precip_in")
+
+    df = pd.DataFrame(all_rows)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    s = df.set_index("date")["value"].astype(float).sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    s.name = "precip_in"
+    return s
+
+
+def load_or_fetch_noaa_precip(token: str, start: date, end: date) -> pd.Series:
+    if NOAA_CACHE_CSV.exists():
+        print(f"Loading cached NOAA precip: {NOAA_CACHE_CSV.name}")
+        tmp = pd.read_csv(NOAA_CACHE_CSV)
+        if "date" not in tmp.columns:
+            tmp = tmp.rename(columns={tmp.columns[0]: "date"})
+        tmp["date"] = pd.to_datetime(tmp["date"]).dt.date
+        if "precip_in" not in tmp.columns:
+            for c in tmp.columns:
+                if "precip" in c.lower():
+                    tmp = tmp.rename(columns={c: "precip_in"})
+                    break
+        s = tmp.set_index("date")["precip_in"].astype(float).sort_index()
+        s = s.loc[(s.index >= start) & (s.index <= end)]
+        s.name = "precip_in"
+        return s
+
+    print("NOAA cache not found — downloading NOAA PRCP...")
+    s = fetch_noaa_ghcnd_prcp_daily_in(
+        station_id=NOAA_STATION_ID,
+        start=start,
+        end=end,
+        token=token,
+    )
+    pd.DataFrame({"date": s.index, "precip_in": s.values}).to_csv(NOAA_CACHE_CSV, index=False)
+    print(f"Saved NOAA cache: {NOAA_CACHE_CSV.name}")
+    return s
+
+
+# ----------------------------
+# Daily cache (robust)
+# ----------------------------
+def load_daily_cache(path: Path) -> pd.DataFrame:
+    raw = pd.read_csv(path)
+    if "date" not in raw.columns:
+        raw = raw.rename(columns={raw.columns[0]: "date"})
+    raw["date"] = pd.to_datetime(raw["date"]).dt.date
+    daily = raw.set_index("date").sort_index()
+    daily.index.name = "date"
+
+    if "salinity" not in daily.columns:
+        raise ValueError("Daily cache missing required column: salinity")
+    if "precip_in" not in daily.columns:
+        for c in daily.columns:
+            if "precip" in c.lower():
+                daily = daily.rename(columns={c: "precip_in"})
+                break
+    return daily
+
+
+def save_daily_cache(path: Path, daily: pd.DataFrame) -> None:
+    out = daily.copy()
+    out.index.name = "date"
+    out.reset_index().to_csv(path, index=False)
+
+
+# ----------------------------
+# Dashboard
+# ----------------------------
+def build_dashboard_html(daily: pd.DataFrame, output_html: str, title: str) -> str:
     if daily.empty:
         raise ValueError("No daily data to plot.")
 
-    data_start = daily.index.min().date().isoformat()
-    data_end = daily.index.max().date().isoformat()
+    data_start = daily.index.min().isoformat()
+    data_end = daily.index.max().isoformat()
 
-    dates = [d.strftime("%Y-%m-%d") for d in daily.index]
+    dates = [d.isoformat() for d in daily.index]
     sal = [None if pd.isna(v) else float(v) for v in daily["salinity"].tolist()]
-    pr = [None if pd.isna(v) else float(v) for v in daily["precip_in"].tolist()]
 
-    # Plotly figure skeleton; JS fills traces based on user inputs
+    if "precip_in" in daily.columns:
+        pr = [None if pd.isna(v) else float(v) for v in daily["precip_in"].tolist()]
+    else:
+        pr = [None for _ in dates]
+
     fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.10,
-        subplot_titles=("Salinity (daily mean)", "Precipitation (daily total)"),
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10,
+        subplot_titles=("Salinity (daily mean)", "Precipitation (NOAA GHCND PRCP, inches)"),
     )
 
-    # Trace order (JS uses these indices):
-    # 0 sal line
-    fig.add_trace(
-        go.Scatter(x=[], y=[], mode="lines", name="Salinity", opacity=0.85),
-        row=1, col=1
-    )
-
-    # 1 sal highlight markers (outliers)
+    # Salinity: line + highlighted markers + 7d mean
+    fig.add_trace(go.Scatter(x=[], y=[], mode="lines", name="Salinity", opacity=0.85), row=1, col=1)
     fig.add_trace(
         go.Scatter(
-            x=[], y=[], mode="markers", name="Salinity (outliers)",
-            marker=dict(size=7, symbol="circle-open"),
-            opacity=0.9
+            x=[], y=[], mode="markers", name="Salinity (highlighted)",
+            marker=dict(size=7, symbol="circle-open"), opacity=0.95
         ),
         row=1, col=1
     )
+    fig.add_trace(go.Scatter(x=[], y=[], mode="lines", name="Salinity (7d mean)", opacity=0.9), row=1, col=1)
 
-    # 2 sal rolling 7d mean
-    fig.add_trace(
-        go.Scatter(x=[], y=[], mode="lines", name="Salinity (7d mean)", opacity=0.9),
-        row=1, col=1
-    )
-
-    # 3 precip bars (base)
-    fig.add_trace(
-        go.Bar(x=[], y=[], name="Precip (in)", opacity=0.45),
-        row=2, col=1
-    )
-
-    # 4 precip highlight bars (outliers)
-    fig.add_trace(
-        go.Bar(x=[], y=[], name="Precip (outliers)", opacity=0.9),
-        row=2, col=1
-    )
-
-    # 5 precip rolling 7d mean
-    fig.add_trace(
-        go.Scatter(x=[], y=[], mode="lines", name="Precip (7d mean)", opacity=0.9),
-        row=2, col=1
-    )
+    # Precip: bars + highlighted bars + 7d mean
+    fig.add_trace(go.Bar(x=[], y=[], name="Precip (in)", opacity=0.45), row=2, col=1)
+    fig.add_trace(go.Bar(x=[], y=[], name="Precip (highlighted)", opacity=0.9), row=2, col=1)
+    fig.add_trace(go.Scatter(x=[], y=[], mode="lines", name="Precip (7d mean)", opacity=0.9), row=2, col=1)
 
     fig.update_layout(
         title=title,
         hovermode="x unified",
-        height=950,
+        height=980,
         margin=dict(l=60, r=30, t=90, b=60),
         barmode="overlay",
     )
-    fig.update_yaxes(title_text="Salinity (sensor units)", row=1, col=1)
+    fig.update_yaxes(title_text="Salinity", row=1, col=1)
     fig.update_yaxes(title_text="Inches", row=2, col=1)
     fig.update_xaxes(title_text="Date", row=2, col=1, rangeslider=dict(visible=True))
 
@@ -336,8 +474,8 @@ def build_dashboard_html(
     </div>
 
     <div class="hint">
-      Highlights use <b>mean ± (k·σ)</b> over the displayed interval.
-      Rolling overlays are <b>7-day means</b> (computed over available values).
+      Highlights use <b>mean ± (k·σ)</b> over the displayed interval (precip can optionally highlight only above avg).
+      Rolling overlays are <b>7-day means</b>.
       Available data window: {data_start} to {data_end}.
     </div>
   </div>
@@ -380,7 +518,7 @@ def build_dashboard_html(
       const diff = v - mean;
       ss += diff * diff;
     }}
-    const std = Math.sqrt(ss / n); // population std
+    const std = Math.sqrt(ss / n);
     return {{mean, std}};
   }}
 
@@ -396,7 +534,6 @@ def build_dashboard_html(
   }}
 
   function rollingMean(values, windowDays=7) {{
-    // aligned array; ignores nulls; at least 1 numeric in window needed
     const out = new Array(values.length).fill(null);
     let window = [];
     let windowSum = 0;
@@ -441,7 +578,6 @@ def build_dashboard_html(
     const kPr  = Math.max(0, Number(kPrInput.value || 0));
     const prAboveOnly = !!prAboveOnlyInput.checked;
 
-    // Filter arrays to date window
     const dates = [];
     const sal = [];
     const pr = [];
@@ -470,7 +606,6 @@ def build_dashboard_html(
     const prLo  = prStats.mean  - kPr  * prStats.std;
     const prHi  = prStats.mean  + kPr  * prStats.std;
 
-    // Highlight arrays
     const salHX = [], salHY = [];
     for (let i = 0; i < dates.length; i++) {{
       const v = sal[i];
@@ -499,11 +634,9 @@ def build_dashboard_html(
       }}
     }}
 
-    // Rolling 7-day means
     const salRoll = rollingMean(sal, 7);
     const prRoll  = rollingMean(pr, 7);
 
-    // Update text indicators
     salStatsEl.innerHTML =
       `Salinity avg: <b>${{fmt(salStats.mean)}}</b> | std: <b>${{fmt(salStats.std)}}</b> | coverage: <b>${{pct(salPresent, totalDays)}}</b> | highlight: <b>mean ± ${{kSal}}·σ</b>`;
 
@@ -516,7 +649,6 @@ def build_dashboard_html(
         `Precip avg: <b>${{fmt(prStats.mean)}}</b> | std: <b>${{fmt(prStats.std)}}</b> | coverage: <b>${{pct(prPresent, totalDays)}}</b> | highlight: <b>mean ± ${{kPr}}·σ</b>`;
     }}
 
-    // Update Plotly traces by fixed indices
     Plotly.restyle(plotId, {{ x: [dates], y: [sal] }}, [0]);
     Plotly.restyle(plotId, {{ x: [salHX], y: [salHY] }}, [1]);
     Plotly.restyle(plotId, {{ x: [dates], y: [salRoll] }}, [2]);
@@ -560,70 +692,57 @@ def build_dashboard_html(
 # ----------------------------
 def main() -> None:
     requested_end = date.today()
-    requested_start = requested_end - timedelta(days=365 * 5)
+    requested_start = requested_end - timedelta(days=365 * WINDOW_YEARS)
+    print(f"Requested window: {requested_start} to {requested_end}")
 
-    print(f"Requested: {requested_start} to {requested_end}")
+    noaa_token = os.environ.get("NOAA_TOKEN")
+    if not noaa_token:
+        raise RuntimeError(
+            "NOAA_TOKEN is not set.\n"
+            "In Terminal run:\n"
+            "  export NOAA_TOKEN='YOUR_TOKEN_HERE'\n"
+            "Then re-run the script."
+        )
 
-    # Fetch continuous in chunks
-    sal_cont = fetch_continuous_values_chunked(
-        PIER26_MONITORING_LOCATION_ID,
-        SALINITY_PCODE,
-        requested_start,
-        requested_end,
-        statistic_id=CONT_STAT_ID,
-        chunk_days=CHUNK_DAYS,
-    )
-
-    pr_cont = fetch_continuous_values_chunked(
-        PIER26_MONITORING_LOCATION_ID,
-        PRECIP_PCODE,
-        requested_start,
-        requested_end,
-        statistic_id=CONT_STAT_ID,
-        chunk_days=CHUNK_DAYS,
-    )
-
-    if pr_cont.empty:
-      print("Precip is EMPTY for requested window.")
+    # Fast path: load merged cache if present
+    if DAILY_CACHE_CSV.exists():
+        print(f"Loading cached daily data: {DAILY_CACHE_CSV.name}")
+        daily = load_daily_cache(DAILY_CACHE_CSV)
+        daily = daily.loc[(daily.index >= requested_start) & (daily.index <= requested_end)]
     else:
-      print("Precip first:", pr_cont["time"].min())
-      print("Precip last: ", pr_cont["time"].max())
+        # USGS salinity (continuous -> daily mean)
+        sal_cont = fetch_usgs_continuous_values_chunked(
+            monitoring_location_id=PIER26_MONITORING_LOCATION_ID,
+            parameter_code=SALINITY_PCODE,
+            start=requested_start,
+            end=requested_end,
+            statistic_id=USGS_CONT_STAT_ID,
+            chunk_days=USGS_CHUNK_DAYS,
+        )
+        sal_daily = to_daily_mean(sal_cont, name="salinity")
 
+        # NOAA precip (with cache)
+        noaa_precip = load_or_fetch_noaa_precip(
+            token=noaa_token,
+            start=requested_start,
+            end=requested_end,
+        )
+        print(f"NOAA precip rows (daily): {len(noaa_precip)}")
 
-    # Aggregate to daily
-    sal_daily = to_daily_mean(sal_cont)
-    pr_daily = to_daily_total(pr_cont)
+        daily = pd.DataFrame({"salinity": sal_daily}).join(noaa_precip, how="outer").sort_index()
+        daily.index.name = "date"
+        daily = daily.loc[(daily.index >= requested_start) & (daily.index <= requested_end)]
 
-    # Combine
-    daily = pd.DataFrame(
-        {
-            "salinity": sal_daily,
-            "precip_in": pr_daily,
-        }
-    ).sort_index()
-    daily.index.name = "date_utc"
+        save_daily_cache(DAILY_CACHE_CSV, daily)
+        print(f"Saved daily cache CSV: {DAILY_CACHE_CSV.name}")
 
-    # Defensive clip to last 5 years
-    daily = daily.loc[
-        (daily.index >= pd.to_datetime(requested_start, utc=True))
-        & (daily.index <= pd.to_datetime(requested_end, utc=True))
-    ]
-
-    # Save CSV
-    csv_path = BASE_DIR / "pier26_last5y_salinity_precip_daily.csv"
-    daily.to_csv(csv_path)
-
-    # Write dashboard as index.html (GitHub Pages default)
-    html_path = BASE_DIR / "index.html"
     build_dashboard_html(
         daily=daily,
-        output_html=str(html_path),
-        title="Pier 26 (USGS-01376520): Salinity + Precipitation — last 5 years",
+        output_html=str(DASHBOARD_HTML),
+        title=f"Pier 26: USGS Salinity + NOAA Precip (inches) — last {WINDOW_YEARS} years",
     )
-
-    print(f"Saved CSV: {csv_path}")
-    print(f"Saved dashboard: {html_path}")
-    print(f"Open in browser: open \"{html_path}\"")
+    print(f"Saved dashboard: {DASHBOARD_HTML}")
+    print(f"Open in browser: open \"{DASHBOARD_HTML}\"")
 
 
 if __name__ == "__main__":
